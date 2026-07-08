@@ -1,12 +1,12 @@
-"""104 人力銀行 search API fetcher(v2:瀏覽器偽裝強化版)。
+"""104 人力銀行 search API fetcher(v3:支援 Cloudflare Worker 代理)。
 
-v2 變更:
-  1. 先訪問搜尋頁面取得 cookies(warm-up),再打 API
-  2. 帶完整的瀏覽器 headers(Accept-Language / sec-fetch 系列)
-  3. 403 時自動重試(exponential backoff)
-  4. 全部關鍵字都 403 時,印出明確的診斷訊息
+v3 變更:
+  - 若環境變數 PROXY_URL / PROXY_TOKEN 有設定,所有請求改走代理
+    (GitHub Actions IP 被 104 封鎖時的解法)
+  - 走代理時不需要 warm-up 和瀏覽器 headers(由 Worker 端處理)
 """
 import json
+import os
 import time
 from datetime import date
 from pathlib import Path
@@ -15,6 +15,9 @@ import httpx
 
 SEARCH_PAGE = "https://www.104.com.tw/jobs/search/"
 SEARCH_URL = "https://www.104.com.tw/jobs/search/api/jobs"
+
+PROXY_URL = os.environ.get("PROXY_URL", "").strip().rstrip("/")
+PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "").strip()
 
 HEADERS = {
     "User-Agent": (
@@ -28,9 +31,6 @@ HEADERS = {
     "Sec-Fetch-Dest": "empty",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
-    "sec-ch-ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
 }
 
 DEBUG_DIR = Path(__file__).resolve().parent.parent / "data" / "debug"
@@ -85,8 +85,19 @@ def _parse_item(item: dict, keyword_group: str) -> dict:
     }
 
 
+def _request_url_and_params(params: dict) -> tuple[str, dict, dict]:
+    """依是否設定代理,決定實際請求的 URL / params / headers。"""
+    if PROXY_URL:
+        proxied = dict(params)
+        proxied["token"] = PROXY_TOKEN
+        return PROXY_URL, proxied, {"Accept": "application/json"}
+    return SEARCH_URL, params, HEADERS
+
+
 def _warm_up(client: httpx.Client) -> None:
-    """先當一般使用者逛一次搜尋頁,取得 session cookies。"""
+    if PROXY_URL:
+        print(f"使用代理模式: {PROXY_URL[:40]}...(跳過 warm-up)")
+        return
     try:
         resp = client.get(
             SEARCH_PAGE,
@@ -100,17 +111,17 @@ def _warm_up(client: httpx.Client) -> None:
 
 
 def _get_with_retry(client: httpx.Client, params: dict) -> httpx.Response:
-    """帶 exponential backoff 的請求。"""
+    url, real_params, headers = _request_url_and_params(params)
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
-            resp = client.get(SEARCH_URL, params=params, headers=HEADERS, timeout=30)
+            resp = client.get(url, params=real_params, headers=headers, timeout=30)
             resp.raise_for_status()
             return resp
         except httpx.HTTPStatusError as e:
             last_exc = e
             if e.response.status_code in (403, 429):
-                wait = 5 * (2 ** attempt)  # 5s, 10s, 20s
+                wait = 5 * (2 ** attempt)
                 print(f"    HTTP {e.response.status_code},{wait}s 後重試({attempt + 1}/{MAX_RETRIES})")
                 time.sleep(wait)
             else:
@@ -168,7 +179,7 @@ def fetch_all(cfg: dict) -> list[dict]:
     failures = 0
     total_keywords = sum(len(v) for v in cfg.get("keyword_groups", {}).values())
 
-    with httpx.Client(follow_redirects=True, http2=False) as client:
+    with httpx.Client(follow_redirects=True) as client:
         _warm_up(client)
         time.sleep(2)
 
@@ -181,9 +192,10 @@ def fetch_all(cfg: dict) -> list[dict]:
                     print(f"  !! [{group}/{kw}] 抓取失敗: {e}")
 
     if failures == total_keywords and total_keywords > 0:
+        mode = "代理" if PROXY_URL else "直連"
         print(
-            "\n*** 全部關鍵字抓取失敗 — 很可能是來源 IP 被 104 封鎖 ***\n"
-            "*** 請改用 Plan B(Cloudflare Worker 代理),詳見專案 README 或詢問 Claude ***"
+            f"\n*** 全部關鍵字抓取失敗(目前為{mode}模式)***\n"
+            "*** 請把此 log 貼給 Claude 診斷 ***"
         )
 
     print(f"共抓到 {len(all_jobs)} 筆(去重前),日期 {date.today()}")
