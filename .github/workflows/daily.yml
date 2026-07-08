@@ -1,0 +1,36 @@
+name: Daily Job Radar
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 01:00 UTC = 台北 09:00
+  workflow_dispatch: {}    # 允許手動觸發(第一次測試用)
+
+permissions:
+  contents: write          # 讓 workflow 能把資料庫 commit 回 repo
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
+          SHEET_TOKEN: ${{ secrets.SHEET_TOKEN }}
+        run: python main.py
+
+      - name: Commit data back to repo
+        run: |
+          git config user.name "job-radar-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "daily update $(date -u +%F)"
+          git push
