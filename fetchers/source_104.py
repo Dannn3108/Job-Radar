@@ -1,9 +1,10 @@
-"""104 人力銀行 search API fetcher.
+"""104 人力銀行 search API fetcher(v2:瀏覽器偽裝強化版)。
 
-104 的搜尋 API 是半公開的(網頁前端自己在用),欄位可能隨改版變動。
-因此這裡採防禦式寫法:
-  1. 欄位用「候選名單」逐一嘗試
-  2. 第一次執行會把 raw response 存到 data/debug/,解析失敗時可以直接看原始資料修
+v2 變更:
+  1. 先訪問搜尋頁面取得 cookies(warm-up),再打 API
+  2. 帶完整的瀏覽器 headers(Accept-Language / sec-fetch 系列)
+  3. 403 時自動重試(exponential backoff)
+  4. 全部關鍵字都 403 時,印出明確的診斷訊息
 """
 import json
 import time
@@ -12,21 +13,31 @@ from pathlib import Path
 
 import httpx
 
+SEARCH_PAGE = "https://www.104.com.tw/jobs/search/"
 SEARCH_URL = "https://www.104.com.tw/jobs/search/api/jobs"
+
 HEADERS = {
-    "Referer": "https://www.104.com.tw/jobs/search/",
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.104.com.tw/jobs/search/",
+    "Origin": "https://www.104.com.tw",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "sec-ch-ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
 
 DEBUG_DIR = Path(__file__).resolve().parent.parent / "data" / "debug"
+MAX_RETRIES = 3
 
 
 def _pick(d: dict, *candidates, default=""):
-    """從候選欄位名中取第一個存在的值。"""
     for key in candidates:
         if key in d and d[key] not in (None, ""):
             return d[key]
@@ -34,7 +45,6 @@ def _pick(d: dict, *candidates, default=""):
 
 
 def _extract_items(payload: dict):
-    """從 response 中找出職缺列表(容忍不同的包裝結構)。"""
     if isinstance(payload.get("data"), list):
         return payload["data"]
     data = payload.get("data", {})
@@ -56,7 +66,6 @@ def _total_pages(payload: dict) -> int:
 
 
 def _parse_item(item: dict, keyword_group: str) -> dict:
-    """raw item → 統一 schema。欄位名以 2025 年觀察到的為主,備援舊欄位名。"""
     link = item.get("link", {}) if isinstance(item.get("link"), dict) else {}
     job_url = _pick(link, "job") or _pick(item, "jobUrl", "url")
     if job_url.startswith("//"):
@@ -76,8 +85,40 @@ def _parse_item(item: dict, keyword_group: str) -> dict:
     }
 
 
+def _warm_up(client: httpx.Client) -> None:
+    """先當一般使用者逛一次搜尋頁,取得 session cookies。"""
+    try:
+        resp = client.get(
+            SEARCH_PAGE,
+            params={"keyword": "採購"},
+            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml"},
+            timeout=30,
+        )
+        print(f"warm-up: HTTP {resp.status_code}, cookies: {len(client.cookies)} 個")
+    except Exception as e:
+        print(f"warm-up 失敗(不中斷): {e}")
+
+
+def _get_with_retry(client: httpx.Client, params: dict) -> httpx.Response:
+    """帶 exponential backoff 的請求。"""
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = client.get(SEARCH_URL, params=params, headers=HEADERS, timeout=30)
+            resp.raise_for_status()
+            return resp
+        except httpx.HTTPStatusError as e:
+            last_exc = e
+            if e.response.status_code in (403, 429):
+                wait = 5 * (2 ** attempt)  # 5s, 10s, 20s
+                print(f"    HTTP {e.response.status_code},{wait}s 後重試({attempt + 1}/{MAX_RETRIES})")
+                time.sleep(wait)
+            else:
+                raise
+    raise last_exc
+
+
 def fetch_keyword(client: httpx.Client, keyword: str, keyword_group: str, cfg: dict) -> list[dict]:
-    """抓單一關鍵字的所有分頁,回傳統一 schema 的職缺列表。"""
     results = []
     max_pages = cfg.get("max_pages_per_keyword", 5)
     delay = cfg.get("request_delay_seconds", 2.5)
@@ -88,18 +129,16 @@ def fetch_keyword(client: httpx.Client, keyword: str, keyword_group: str, cfg: d
         params = {
             "keyword": keyword,
             "area": ",".join(cfg.get("areas", [])),
-            "order": "16",  # 依日期排序(新→舊)
+            "order": "16",
             "page": page,
             "pagesize": 20,
         }
         if cfg.get("jobexp"):
             params["jobexp"] = cfg["jobexp"]
 
-        resp = client.get(SEARCH_URL, params=params, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
+        resp = _get_with_retry(client, params)
         payload = resp.json()
 
-        # 首次執行留存 raw sample 供 debug
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
         sample_path = DEBUG_DIR / "sample_response.json"
         if not sample_path.exists():
@@ -125,14 +164,27 @@ def fetch_keyword(client: httpx.Client, keyword: str, keyword_group: str, cfg: d
 
 
 def fetch_all(cfg: dict) -> list[dict]:
-    """依 config 的所有關鍵字組抓取,回傳合併結果(尚未去重)。"""
     all_jobs = []
-    with httpx.Client(follow_redirects=True) as client:
+    failures = 0
+    total_keywords = sum(len(v) for v in cfg.get("keyword_groups", {}).values())
+
+    with httpx.Client(follow_redirects=True, http2=False) as client:
+        _warm_up(client)
+        time.sleep(2)
+
         for group, keywords in cfg.get("keyword_groups", {}).items():
             for kw in keywords:
                 try:
                     all_jobs.extend(fetch_keyword(client, kw, group, cfg))
-                except Exception as e:  # 單一關鍵字失敗不中斷整個 pipeline
+                except Exception as e:
+                    failures += 1
                     print(f"  !! [{group}/{kw}] 抓取失敗: {e}")
+
+    if failures == total_keywords and total_keywords > 0:
+        print(
+            "\n*** 全部關鍵字抓取失敗 — 很可能是來源 IP 被 104 封鎖 ***\n"
+            "*** 請改用 Plan B(Cloudflare Worker 代理),詳見專案 README 或詢問 Claude ***"
+        )
+
     print(f"共抓到 {len(all_jobs)} 筆(去重前),日期 {date.today()}")
     return all_jobs
