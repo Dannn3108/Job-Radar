@@ -25,6 +25,8 @@ jobs:
         env:
           SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
           SHEET_TOKEN: ${{ secrets.SHEET_TOKEN }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          PROXY_TOKEN: ${{ secrets.PROXY_TOKEN }}
         run: python main.py
 
       - name: Commit data back to repo
