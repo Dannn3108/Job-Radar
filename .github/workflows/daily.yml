@@ -2,7 +2,7 @@ name: Daily Job Radar
 
 on:
   schedule:
-    - cron: '0 1 * * *'   # 01:00 UTC = 台北 09:00
+    - cron: '15 1 * * *'   # 01:15 UTC = 台北 09:15
   workflow_dispatch: {}    # 允許手動觸發(第一次測試用)
 
 permissions:
