@@ -1,14 +1,9 @@
-"""訊號層:WoW 招募加速 + 新公司發現。
-
-全部基於 jobs.first_seen(系統自建時間序列),
-所以前兩週資料還在累積時,訊號會偏少 — 這是正常的。
-"""
+"""訊號層 v2:WoW 招募加速 + 新公司發現(watchlist 改為 dict 格式)。"""
 import sqlite3
 from datetime import date, timedelta
 
 
 def velocity_signals(conn: sqlite3.Connection, cfg: dict) -> list[dict]:
-    """WoW:本週 vs 上週各公司新出現的職缺數。"""
     rules = cfg["signals"]["velocity"]
     today = date.today()
     week_ago = (today - timedelta(days=7)).isoformat()
@@ -37,16 +32,14 @@ def velocity_signals(conn: sqlite3.Connection, cfg: dict) -> list[dict]:
                 "company": r["company"],
                 "detail": f"招募加速:本週新增 {this_w} 筆(上週 {prev_w} 筆,{growth_txt})",
                 "this_week": this_w,
-                "prev_week": prev_w,
             })
     signals.sort(key=lambda s: s["this_week"], reverse=True)
     return signals
 
 
 def discovery_signals(conn: sqlite3.Connection, cfg: dict) -> list[dict]:
-    """發現不在 watchlist、但近期大量開出目標職能職缺的公司。"""
     rules = cfg["signals"]["discovery"]
-    watchlist = set(cfg.get("watchlist", []))
+    watchlist_names = {w["name"] for w in cfg.get("watchlist", [])}
     since = (date.today() - timedelta(days=rules["window_days"])).isoformat()
 
     rows = conn.execute(
@@ -68,8 +61,7 @@ def discovery_signals(conn: sqlite3.Connection, cfg: dict) -> list[dict]:
                 f"過去 {rules['window_days']} 天開出 {r['n']} 筆目標職缺"
                 f"({r['groups']}),不在 watchlist — 建議研究後加入追蹤"
             ),
-            "count": r["n"],
         }
         for r in rows
-        if r["company"] not in watchlist
+        if not any(name and name in r["company"] for name in watchlist_names)
     ]
