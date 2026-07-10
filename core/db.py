@@ -1,8 +1,4 @@
-"""SQLite 儲存層:jobs / daily_snapshots 兩張表。
-
-WoW 一律以系統自己記錄的 first_seen 為準,不信任平台的 posted_date
-(公司會重登職缺洗排序,平台日期會失真)。
-"""
+"""SQLite 儲存層 v2:新欄位 + 自動遷移(既有資料不會遺失)。"""
 import hashlib
 import sqlite3
 from datetime import date
@@ -40,9 +36,18 @@ CREATE TABLE IF NOT EXISTS daily_snapshots (
 );
 """
 
+# v2 新增欄位:自動遷移(存在則略過)
+NEW_COLUMNS = {
+    "company_hash": "TEXT DEFAULT ''",
+    "description": "TEXT DEFAULT ''",
+    "period": "TEXT DEFAULT ''",
+    "apply_cnt": "INTEGER DEFAULT 0",
+    "co_industry": "TEXT DEFAULT ''",
+    "employee_count": "INTEGER DEFAULT 0",
+}
+
 
 def make_job_id(job: dict) -> str:
-    """優先用 source+jobNo(最穩);缺 jobNo 時退回 company+title。"""
     key = (
         f"{job['source']}:{job['source_job_no']}"
         if job.get("source_job_no")
@@ -56,11 +61,21 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+    for col, ddl in NEW_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
+            print(f"db migrate: 新增欄位 {col}")
+    conn.commit()
+
+
 def upsert_jobs(conn: sqlite3.Connection, jobs: list[dict]) -> tuple[int, int]:
-    """寫入職缺。回傳 (新增數, 既有更新數)。"""
+    """寫入職缺。既有職缺更新 last_seen / apply_cnt / salary 等動態值。"""
     today = date.today().isoformat()
     inserted = updated = 0
     for job in jobs:
@@ -68,20 +83,30 @@ def upsert_jobs(conn: sqlite3.Connection, jobs: list[dict]) -> tuple[int, int]:
         row = conn.execute("SELECT job_id FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         if row:
             conn.execute(
-                "UPDATE jobs SET last_seen = ?, status = 'active' WHERE job_id = ?",
-                (today, job_id),
+                """UPDATE jobs SET last_seen = ?, status = 'active',
+                   apply_cnt = ?, salary = ?,
+                   company_hash = CASE WHEN company_hash = '' THEN ? ELSE company_hash END,
+                   description = CASE WHEN description = '' THEN ? ELSE description END
+                   WHERE job_id = ?""",
+                (today, job.get("apply_cnt", 0), job.get("salary", ""),
+                 job.get("company_hash", ""), job.get("description", ""), job_id),
             )
             updated += 1
         else:
             conn.execute(
                 """INSERT INTO jobs (job_id, source, source_job_no, company, company_no,
-                   title, location, salary, url, posted_date, keyword_group,
+                   company_hash, title, location, salary, url, posted_date, keyword_group,
+                   description, period, apply_cnt, co_industry, employee_count,
                    first_seen, last_seen, status)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'active')""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active')""",
                 (
                     job_id, job["source"], job["source_job_no"], job["company"],
-                    job["company_no"], job["title"], job["location"], job["salary"],
-                    job["url"], job["posted_date"], job["keyword_group"],
+                    job.get("company_no", ""), job.get("company_hash", ""),
+                    job["title"], job["location"], job["salary"], job["url"],
+                    job["posted_date"], job["keyword_group"],
+                    job.get("description", ""), job.get("period", ""),
+                    job.get("apply_cnt", 0), job.get("co_industry", ""),
+                    job.get("employee_count", 0),
                     today, today,
                 ),
             )
@@ -91,7 +116,6 @@ def upsert_jobs(conn: sqlite3.Connection, jobs: list[dict]) -> tuple[int, int]:
 
 
 def mark_delisted(conn: sqlite3.Connection) -> int:
-    """今天沒再出現的職缺標記為下架。"""
     today = date.today().isoformat()
     cur = conn.execute(
         "UPDATE jobs SET status = 'delisted' WHERE last_seen < ? AND status = 'active'",
@@ -102,7 +126,6 @@ def mark_delisted(conn: sqlite3.Connection) -> int:
 
 
 def write_snapshot(conn: sqlite3.Connection) -> None:
-    """寫入當日各公司 × 關鍵字組的統計快照。"""
     today = date.today().isoformat()
     conn.execute("DELETE FROM daily_snapshots WHERE snapshot_date = ?", (today,))
     conn.execute(
@@ -114,3 +137,26 @@ def write_snapshot(conn: sqlite3.Connection) -> None:
         (today, today),
     )
     conn.commit()
+
+
+def resolve_watchlist(conn: sqlite3.Connection, watchlist: list[dict]) -> list[dict]:
+    """為 watchlist 補公司頁代碼:Sheet 已填的直接用,空白的從資料庫比對公司名。"""
+    resolved = []
+    for entry in watchlist:
+        name = str(entry.get("name", "")).strip()
+        code = str(entry.get("company_no", "")).strip()
+        if name and not code:
+            row = conn.execute(
+                """SELECT company_hash FROM jobs
+                   WHERE company LIKE ? AND company_hash != ''
+                   ORDER BY last_seen DESC LIMIT 1""",
+                (f"%{name}%",),
+            ).fetchone()
+            if row:
+                code = row["company_hash"]
+        resolved.append({"name": name, "company_no": code})
+    return resolved
+
+
+def all_active_job_ids(conn: sqlite3.Connection) -> list[str]:
+    return [r["job_id"] for r in conn.execute("SELECT job_id FROM jobs WHERE status = 'active'")]
