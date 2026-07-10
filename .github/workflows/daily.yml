@@ -2,8 +2,8 @@ name: Daily Job Radar
 
 on:
   schedule:
-    - cron: '15 1 * * *'   # 01:15 UTC = 台北 09:15
-  workflow_dispatch: {}    # 允許手動觸發(第一次測試用)
+    - cron: '*/30 * * * *'   # 暫時:每 30 分鐘(診斷用)
+  workflow_dispatch: {}
 
 permissions:
   contents: write          # 讓 workflow 能把資料庫 commit 回 repo
