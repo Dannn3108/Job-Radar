@@ -1,9 +1,10 @@
-"""104 人力銀行 search API fetcher(v3:支援 Cloudflare Worker 代理)。
+"""104 fetcher(v4):薪資修正、新欄位、watchlist 專屬通道、飽和偵測支援。
 
-v3 變更:
-  - 若環境變數 PROXY_URL / PROXY_TOKEN 有設定,所有請求改走代理
-    (GitHub Actions IP 被 104 封鎖時的解法)
-  - 走代理時不需要 warm-up 和瀏覽器 headers(由 Worker 端處理)
+- 薪資改用 salaryLow / salaryHigh 解析(依 2026-07 實測欄位)
+- 新增欄位:description(截 300 字)、period、apply_cnt、co_industry、employee_count、company_hash
+- fetch_all 回傳「批次」結構(含頁數資訊),供 main 做飽和偵測
+- fetch_watchlist:抓 watchlist 公司的全部在架職缺,本地過濾關鍵字(絕不漏抓通道)
+- 代理支援 path 參數,可轉發公司職缺列表端點(需搭配 worker.js v2)
 """
 import json
 import os
@@ -13,8 +14,8 @@ from pathlib import Path
 
 import httpx
 
-SEARCH_PAGE = "https://www.104.com.tw/jobs/search/"
-SEARCH_URL = "https://www.104.com.tw/jobs/search/api/jobs"
+BASE = "https://www.104.com.tw"
+SEARCH_PATH = "jobs/search/api/jobs"
 
 PROXY_URL = os.environ.get("PROXY_URL", "").strip().rstrip("/")
 PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "").strip()
@@ -25,16 +26,13 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Language": "zh-TW,zh;q=0.9",
     "Referer": "https://www.104.com.tw/jobs/search/",
-    "Origin": "https://www.104.com.tw",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
 }
 
 DEBUG_DIR = Path(__file__).resolve().parent.parent / "data" / "debug"
 MAX_RETRIES = 3
+DESC_MAX_CHARS = 300
 
 
 def _pick(d: dict, *candidates, default=""):
@@ -58,60 +56,95 @@ def _extract_items(payload: dict):
 def _total_pages(payload: dict) -> int:
     meta = payload.get("metadata", {}) or {}
     pagination = meta.get("pagination", {}) or {}
-    for source in (pagination, meta, payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}):
-        for key in ("lastPage", "totalPage", "total_pages"):
+    sources = [pagination, meta]
+    if isinstance(payload.get("data"), dict):
+        sources.append(payload["data"])
+    for source in sources:
+        for key in ("lastPage", "totalPage", "total_pages", "totalPages"):
             if isinstance(source, dict) and source.get(key):
                 return int(source[key])
     return 1
 
 
-def _parse_item(item: dict, keyword_group: str) -> dict:
+def _format_salary(item: dict) -> str:
+    """依 salaryLow/salaryHigh 組合薪資描述(預設視為月薪)。"""
+    try:
+        low = int(item.get("salaryLow") or 0)
+        high = int(item.get("salaryHigh") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if low == 0 and high == 0:
+        return "面議"
+    if high >= 9999999 or high == 0:
+        return f"{low:,} 以上"
+    if low == 0:
+        return f"最高 {high:,}"
+    return f"{low:,} ~ {high:,}"
+
+
+def _format_period(item: dict) -> str:
+    """period 推測為年資要求(0=不拘)。此對應為推測,待累積資料驗證。"""
+    p = item.get("period")
+    if p in (None, ""):
+        return ""
+    try:
+        n = int(p)
+    except (TypeError, ValueError):
+        return str(p)
+    return "不拘" if n == 0 else f"{n}年以上"
+
+
+def _company_hash(item: dict) -> str:
+    """從 link.cust 取公司頁代碼(例 .../company/1a2x6bmzu0 → 1a2x6bmzu0)。"""
+    link = item.get("link", {}) if isinstance(item.get("link"), dict) else {}
+    cust_url = link.get("cust", "") or ""
+    if "/company/" in cust_url:
+        return cust_url.rstrip("/").split("/company/")[-1].split("?")[0]
+    return ""
+
+
+def _parse_item(item: dict, keyword_group: str, default_company: str = "") -> dict:
     link = item.get("link", {}) if isinstance(item.get("link"), dict) else {}
     job_url = _pick(link, "job") or _pick(item, "jobUrl", "url")
     if job_url.startswith("//"):
         job_url = "https:" + job_url
 
+    desc = str(_pick(item, "description", "descSnippet", default=""))
     return {
         "source": "104",
         "source_job_no": str(_pick(item, "jobNo", "id", "jobId")),
         "title": _pick(item, "jobName", "name", "title"),
-        "company": _pick(item, "custName", "companyName", "company"),
+        "company": _pick(item, "custName", "companyName", "company") or default_company,
         "company_no": str(_pick(item, "custNo", "companyNo")),
+        "company_hash": _company_hash(item),
         "location": _pick(item, "jobAddrNoDesc", "jobAddress", "area"),
-        "salary": _pick(item, "salaryDesc", "salary"),
+        "salary": _format_salary(item),
         "posted_date": str(_pick(item, "appearDate", "postedDate")),
         "url": job_url,
         "keyword_group": keyword_group,
+        "description": desc[:DESC_MAX_CHARS],
+        "period": _format_period(item),
+        "apply_cnt": int(item.get("applyCnt") or 0),
+        "co_industry": _pick(item, "coIndustryDesc"),
+        "employee_count": int(item.get("employeeCount") or 0),
     }
 
 
-def _request_url_and_params(params: dict) -> tuple[str, dict, dict]:
-    """依是否設定代理,決定實際請求的 URL / params / headers。"""
+def _get_with_retry(client: httpx.Client, path: str, params: dict, referer: str = "") -> httpx.Response:
+    """統一請求入口:代理模式帶 path+token,直連模式打 104 本體。"""
     if PROXY_URL:
-        proxied = dict(params)
-        proxied["token"] = PROXY_TOKEN
-        return PROXY_URL, proxied, {"Accept": "application/json"}
-    return SEARCH_URL, params, HEADERS
+        url = PROXY_URL
+        real_params = dict(params)
+        real_params["token"] = PROXY_TOKEN
+        real_params["path"] = path
+        headers = {"Accept": "application/json"}
+    else:
+        url = f"{BASE}/{path}"
+        real_params = params
+        headers = dict(HEADERS)
+        if referer:
+            headers["Referer"] = referer
 
-
-def _warm_up(client: httpx.Client) -> None:
-    if PROXY_URL:
-        print(f"使用代理模式: {PROXY_URL[:40]}...(跳過 warm-up)")
-        return
-    try:
-        resp = client.get(
-            SEARCH_PAGE,
-            params={"keyword": "採購"},
-            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml"},
-            timeout=30,
-        )
-        print(f"warm-up: HTTP {resp.status_code}, cookies: {len(client.cookies)} 個")
-    except Exception as e:
-        print(f"warm-up 失敗(不中斷): {e}")
-
-
-def _get_with_retry(client: httpx.Client, params: dict) -> httpx.Response:
-    url, real_params, headers = _request_url_and_params(params)
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
@@ -129,74 +162,125 @@ def _get_with_retry(client: httpx.Client, params: dict) -> httpx.Response:
     raise last_exc
 
 
-def fetch_keyword(client: httpx.Client, keyword: str, keyword_group: str, cfg: dict) -> list[dict]:
-    results = []
+def _dump_debug(payload: dict, filename: str) -> None:
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    path = DEBUG_DIR / filename
+    if not path.exists():
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2)[:200_000], encoding="utf-8"
+        )
+
+
+def fetch_keyword(client: httpx.Client, keyword: str, keyword_group: str, cfg: dict) -> dict:
+    """抓單一關鍵字,回傳批次:{keyword, group, jobs, pages_fetched, total_pages}。"""
+    jobs = []
     max_pages = cfg.get("max_pages_per_keyword", 5)
     delay = cfg.get("request_delay_seconds", 2.5)
+    areas = [a for a in cfg.get("areas", []) if str(a).strip()]
 
     page = 1
     total = 1
     while page <= min(total, max_pages):
-        params = {
-            "keyword": keyword,
-            "area": ",".join(cfg.get("areas", [])),
-            "order": "16",
-            "page": page,
-            "pagesize": 20,
-        }
-        if cfg.get("jobexp"):
-            params["jobexp"] = cfg["jobexp"]
+        params = {"keyword": keyword, "order": "16", "page": page, "pagesize": 20}
+        if areas:
+            params["area"] = ",".join(str(a) for a in areas)
+        if str(cfg.get("jobexp", "")).strip():
+            params["jobexp"] = str(cfg["jobexp"]).strip()
 
-        resp = _get_with_retry(client, params)
+        resp = _get_with_retry(client, SEARCH_PATH, params)
         payload = resp.json()
-
-        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-        sample_path = DEBUG_DIR / "sample_response.json"
-        if not sample_path.exists():
-            sample_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2)[:200_000],
-                encoding="utf-8",
-            )
+        _dump_debug(payload, "sample_response.json")
 
         items = _extract_items(payload)
         if page == 1:
             total = _total_pages(payload)
-            print(f"  [{keyword_group}/{keyword}] 共 {total} 頁,抓取上限 {max_pages} 頁,第 1 頁 {len(items)} 筆")
+            print(f"  [{keyword_group}/{keyword}] 共 {total} 頁,上限 {max_pages} 頁,第 1 頁 {len(items)} 筆")
 
         for item in items:
             parsed = _parse_item(item, keyword_group)
             if parsed["title"] and parsed["company"]:
-                results.append(parsed)
+                jobs.append(parsed)
 
         page += 1
         time.sleep(delay)
 
-    return results
+    return {
+        "keyword": keyword,
+        "group": keyword_group,
+        "jobs": jobs,
+        "pages_fetched": min(total, max_pages),
+        "total_pages": total,
+        "max_pages": max_pages,
+    }
 
 
 def fetch_all(cfg: dict) -> list[dict]:
-    all_jobs = []
-    failures = 0
-    total_keywords = sum(len(v) for v in cfg.get("keyword_groups", {}).values())
-
+    """依 config 抓所有關鍵字,回傳批次列表(main 據此做飽和偵測)。"""
+    batches = []
     with httpx.Client(follow_redirects=True) as client:
-        _warm_up(client)
-        time.sleep(2)
-
         for group, keywords in cfg.get("keyword_groups", {}).items():
             for kw in keywords:
                 try:
-                    all_jobs.extend(fetch_keyword(client, kw, group, cfg))
+                    batches.append(fetch_keyword(client, kw, group, cfg))
                 except Exception as e:
-                    failures += 1
                     print(f"  !! [{group}/{kw}] 抓取失敗: {e}")
+                    batches.append({"keyword": kw, "group": group, "jobs": [],
+                                    "pages_fetched": 0, "total_pages": 0,
+                                    "max_pages": cfg.get("max_pages_per_keyword", 5),
+                                    "failed": True})
+    total = sum(len(b["jobs"]) for b in batches)
+    print(f"關鍵字通道共抓到 {total} 筆(去重前),日期 {date.today()}")
+    return batches
 
-    if failures == total_keywords and total_keywords > 0:
-        mode = "代理" if PROXY_URL else "直連"
-        print(
-            f"\n*** 全部關鍵字抓取失敗(目前為{mode}模式)***\n"
-            "*** 請把此 log 貼給 Claude 診斷 ***"
-        )
 
-    print(f"共抓到 {len(all_jobs)} 筆(去重前),日期 {date.today()}")
-    return all_jobs
+def fetch_watchlist(cfg: dict, resolved: list[dict]) -> list[dict]:
+    """Watchlist 專屬通道:抓公司全部在架職缺,本地過濾關鍵字。
+
+    resolved: [{"name": 公司名, "company_no": 公司頁代碼}](代碼空白者跳過並提示)
+    回傳統一 schema 職缺列表。公司端點欄位未實測,採防禦式解析,
+    首次執行會留存 sample_company_response.json 供比對。
+    """
+    # 攤平所有關鍵字:[(關鍵字小寫, 組名)]
+    flat_keywords = [
+        (str(kw).lower(), group)
+        for group, kws in cfg.get("keyword_groups", {}).items()
+        for kw in kws
+    ]
+    delay = cfg.get("request_delay_seconds", 2.5)
+    results = []
+
+    with httpx.Client(follow_redirects=True) as client:
+        for entry in resolved:
+            name, code = entry.get("name", ""), str(entry.get("company_no", "")).strip()
+            if not code:
+                print(f"  [watchlist/{name}] 尚無公司代碼(該公司未曾出現在搜尋結果),待系統累積後自動補")
+                continue
+            try:
+                path = f"company/ajax/joblist/{code}"
+                params = {"roleJobCat": 0, "area": 0, "page": 1, "pageSize": 100, "order": 8, "asc": 0}
+                resp = _get_with_retry(client, path, params, referer=f"{BASE}/company/{code}")
+                payload = resp.json()
+                _dump_debug(payload, "sample_company_response.json")
+
+                items = _extract_items(payload)
+                matched = 0
+                for item in items:
+                    text = (
+                        str(_pick(item, "jobName", "name", "title"))
+                        + " "
+                        + str(_pick(item, "description", "descSnippet", default=""))
+                    ).lower()
+                    hit_group = next((g for kw, g in flat_keywords if kw in text), None)
+                    if hit_group:
+                        parsed = _parse_item(item, hit_group, default_company=name)
+                        if parsed["title"] and parsed["source_job_no"]:
+                            parsed["company_hash"] = parsed["company_hash"] or code
+                            results.append(parsed)
+                            matched += 1
+                print(f"  [watchlist/{name}] 在架 {len(items)} 筆,符合關鍵字 {matched} 筆")
+            except Exception as e:
+                print(f"  !! [watchlist/{name}] 抓取失敗: {e}")
+            time.sleep(delay)
+
+    print(f"watchlist 通道共 {len(results)} 筆")
+    return results
