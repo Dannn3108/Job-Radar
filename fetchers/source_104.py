@@ -233,24 +233,26 @@ def fetch_all(cfg: dict) -> list[dict]:
     return batches
 
 
-WATCHLIST_MAX_PAGES = 10  # 每家公司最多搜 10 頁(200 筆)
+WATCHLIST_MAX_PAGES = 10  # 每家公司最多抓 10 頁
 
 
-def _clean_company_query(name: str) -> str:
-    """公司名轉搜尋詞:去掉括號別名,例「台灣積體電路製造股份有限公司(台積電)」→ 前半。"""
-    for sep in ("(", "("):
-        if sep in name:
-            name = name.split(sep)[0]
-    return name.strip()
+COMPANY_JOBS_PAGESIZE = 40  # 104 公司職缺 API 單頁筆數(實測預設 40)
+
+
+def _company_jobs_path(company_hash: str) -> str:
+    """真實端點(2026-07 抓包驗證):/api/companies/{company_hash}/jobs"""
+    return f"api/companies/{company_hash}/jobs"
 
 
 def fetch_watchlist(cfg: dict, resolved: list[dict]) -> list[dict]:
-    """Watchlist 專屬通道 v2:改用已驗證的搜尋 API,以公司名為關鍵字。
+    """Watchlist 專屬通道 v3:直接調閱公司職缺 API。
 
-    比對順序:
-      1. H 欄有公司代碼 → 用 company_hash 精準比對(排除蹭名字的派遣/仲介缺)
-      2. H 欄空白 → 退回公司名包含比對(較寬鬆),並提示建議補代碼
-    通過公司比對後,再套關鍵字組過濾職能。
+    端點:GET /api/companies/{company_hash}/jobs?page=N&pageSize=40
+    (company_hash = 公司頁網址 /company/xxx 的 xxx,即資料庫的 company_hash / Sheet H 欄)
+
+    流程:逐頁抓該公司「全部」在架職缺 → 套關鍵字組過濾職能 → 符合者入庫。
+    因為是「該公司全部職缺再本地過濾」,達成「絕不漏抓」目標。
+    無 company_hash 的公司無法走此通道(需 Sheet H 欄補代碼),會明確提示。
     """
     flat_keywords = [
         (str(kw).lower(), group)
@@ -264,49 +266,44 @@ def fetch_watchlist(cfg: dict, resolved: list[dict]) -> list[dict]:
         for entry in resolved:
             name = entry.get("name", "")
             code = str(entry.get("company_no", "")).strip()
-            query = _clean_company_query(name)
             if not code:
-                print(f"  [watchlist/{name}] H 欄無代碼,改用名稱比對(較寬鬆)— 建議手動補代碼提高精準度")
+                print(f"  [watchlist/{name}] 無公司代碼(需在 Sheet H 欄補上 /company/ 後那串),本次略過")
+                continue
 
+            path = _company_jobs_path(code)
             try:
                 company_active = matched = 0
                 page = 1
-                total = 1
-                while page <= min(total, WATCHLIST_MAX_PAGES):
-                    params = {"keyword": query, "order": "16", "page": page, "pagesize": 20}
-                    resp = _get_with_retry(client, SEARCH_PATH, params)
+                while page <= WATCHLIST_MAX_PAGES:
+                    params = {"page": page, "pageSize": COMPANY_JOBS_PAGESIZE}
+                    resp = _get_with_retry(client, path, params, referer=f"{BASE}/company/{code}")
                     payload = resp.json()
-                    _dump_debug(payload, "sample_watchlist_response.json")
+                    _dump_debug(payload, "sample_company_jobs.json")
 
                     items = _extract_items(payload)
-                    if page == 1:
-                        total = _total_pages(payload)
                     if not items:
                         break
 
                     for item in items:
                         parsed = _parse_item(item, "watchlist", default_company=name)
-                        # 公司比對:代碼優先,無代碼退回名稱包含
-                        if code:
-                            if parsed["company_hash"] != code:
-                                continue
-                        else:
-                            if query not in parsed["company"]:
-                                continue
+                        if not parsed["source_job_no"]:
+                            continue
                         company_active += 1
-                        # 職能比對:職稱+描述含任一關鍵字
                         text = (parsed["title"] + " " + parsed["description"]).lower()
                         hit_group = next((g for kw, g in flat_keywords if kw in text), None)
-                        if hit_group and parsed["source_job_no"]:
+                        if hit_group:
                             parsed["keyword_group"] = hit_group
                             parsed["company_hash"] = parsed["company_hash"] or code
                             results.append(parsed)
                             matched += 1
 
+                    # 不足一頁 = 已到最後一頁
+                    if len(items) < COMPANY_JOBS_PAGESIZE:
+                        break
                     page += 1
                     time.sleep(delay)
 
-                print(f"  [watchlist/{name}] 搜得該公司在架 {company_active} 筆,符合關鍵字 {matched} 筆")
+                print(f"  [watchlist/{name}] 該公司在架 {company_active} 筆,符合關鍵字 {matched} 筆")
             except Exception as e:
                 print(f"  !! [watchlist/{name}] 抓取失敗: {e}")
             time.sleep(delay)
