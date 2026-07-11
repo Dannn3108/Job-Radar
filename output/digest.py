@@ -10,8 +10,8 @@ DIGEST_DIR = Path(__file__).resolve().parent.parent / "data" / "digests"
 
 # GAS 會在最前面補「標記」欄,這裡的 header 不含標記
 JOBS_HEADER = [
-    "job_id", "首次發現", "公司", "職稱", "地點", "薪資", "年資",
-    "應徵數", "產業", "公司規模", "關鍵字組", "職缺摘要", "狀態", "連結",
+    "Job ID", "First Discovery Date", "Company", "Title", "Location", "Salary", "Tenure",
+    "Applications", "Industry", "Company Size", "Keyword", "JD", "Status", "Link",
 ]
 SIGNALS_HEADER = ["日期", "類型", "公司", "說明"]
 
