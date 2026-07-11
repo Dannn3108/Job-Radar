@@ -51,4 +51,4 @@ signals:
     min_jobs: 3
 
 request_delay_seconds: 2.5
-max_pages_per_keyword: 5
+max_pages_per_keyword: 10
