@@ -233,14 +233,25 @@ def fetch_all(cfg: dict) -> list[dict]:
     return batches
 
 
-def fetch_watchlist(cfg: dict, resolved: list[dict]) -> list[dict]:
-    """Watchlist 專屬通道:抓公司全部在架職缺,本地過濾關鍵字。
+WATCHLIST_MAX_PAGES = 10  # 每家公司最多搜 10 頁(200 筆)
 
-    resolved: [{"name": 公司名, "company_no": 公司頁代碼}](代碼空白者跳過並提示)
-    回傳統一 schema 職缺列表。公司端點欄位未實測,採防禦式解析,
-    首次執行會留存 sample_company_response.json 供比對。
+
+def _clean_company_query(name: str) -> str:
+    """公司名轉搜尋詞:去掉括號別名,例「台灣積體電路製造股份有限公司(台積電)」→ 前半。"""
+    for sep in ("(", "("):
+        if sep in name:
+            name = name.split(sep)[0]
+    return name.strip()
+
+
+def fetch_watchlist(cfg: dict, resolved: list[dict]) -> list[dict]:
+    """Watchlist 專屬通道 v2:改用已驗證的搜尋 API,以公司名為關鍵字。
+
+    比對順序:
+      1. H 欄有公司代碼 → 用 company_hash 精準比對(排除蹭名字的派遣/仲介缺)
+      2. H 欄空白 → 退回公司名包含比對(較寬鬆),並提示建議補代碼
+    通過公司比對後,再套關鍵字組過濾職能。
     """
-    # 攤平所有關鍵字:[(關鍵字小寫, 組名)]
     flat_keywords = [
         (str(kw).lower(), group)
         for group, kws in cfg.get("keyword_groups", {}).items()
@@ -251,33 +262,51 @@ def fetch_watchlist(cfg: dict, resolved: list[dict]) -> list[dict]:
 
     with httpx.Client(follow_redirects=True) as client:
         for entry in resolved:
-            name, code = entry.get("name", ""), str(entry.get("company_no", "")).strip()
+            name = entry.get("name", "")
+            code = str(entry.get("company_no", "")).strip()
+            query = _clean_company_query(name)
             if not code:
-                print(f"  [watchlist/{name}] 尚無公司代碼(該公司未曾出現在搜尋結果),待系統累積後自動補")
-                continue
-            try:
-                path = f"company/ajax/joblist/{code}"
-                params = {"roleJobCat": 0, "area": 0, "page": 1, "pageSize": 100, "order": 8, "asc": 0}
-                resp = _get_with_retry(client, path, params, referer=f"{BASE}/company/{code}")
-                payload = resp.json()
-                _dump_debug(payload, "sample_company_response.json")
+                print(f"  [watchlist/{name}] H 欄無代碼,改用名稱比對(較寬鬆)— 建議手動補代碼提高精準度")
 
-                items = _extract_items(payload)
-                matched = 0
-                for item in items:
-                    text = (
-                        str(_pick(item, "jobName", "name", "title"))
-                        + " "
-                        + str(_pick(item, "description", "descSnippet", default=""))
-                    ).lower()
-                    hit_group = next((g for kw, g in flat_keywords if kw in text), None)
-                    if hit_group:
-                        parsed = _parse_item(item, hit_group, default_company=name)
-                        if parsed["title"] and parsed["source_job_no"]:
+            try:
+                company_active = matched = 0
+                page = 1
+                total = 1
+                while page <= min(total, WATCHLIST_MAX_PAGES):
+                    params = {"keyword": query, "order": "16", "page": page, "pagesize": 20}
+                    resp = _get_with_retry(client, SEARCH_PATH, params)
+                    payload = resp.json()
+                    _dump_debug(payload, "sample_watchlist_response.json")
+
+                    items = _extract_items(payload)
+                    if page == 1:
+                        total = _total_pages(payload)
+                    if not items:
+                        break
+
+                    for item in items:
+                        parsed = _parse_item(item, "watchlist", default_company=name)
+                        # 公司比對:代碼優先,無代碼退回名稱包含
+                        if code:
+                            if parsed["company_hash"] != code:
+                                continue
+                        else:
+                            if query not in parsed["company"]:
+                                continue
+                        company_active += 1
+                        # 職能比對:職稱+描述含任一關鍵字
+                        text = (parsed["title"] + " " + parsed["description"]).lower()
+                        hit_group = next((g for kw, g in flat_keywords if kw in text), None)
+                        if hit_group and parsed["source_job_no"]:
+                            parsed["keyword_group"] = hit_group
                             parsed["company_hash"] = parsed["company_hash"] or code
                             results.append(parsed)
                             matched += 1
-                print(f"  [watchlist/{name}] 在架 {len(items)} 筆,符合關鍵字 {matched} 筆")
+
+                    page += 1
+                    time.sleep(delay)
+
+                print(f"  [watchlist/{name}] 搜得該公司在架 {company_active} 筆,符合關鍵字 {matched} 筆")
             except Exception as e:
                 print(f"  !! [watchlist/{name}] 抓取失敗: {e}")
             time.sleep(delay)
