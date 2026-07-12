@@ -48,8 +48,17 @@ def _extract_items(payload: dict):
     data = payload.get("data", {})
     if isinstance(data, dict):
         for key in ("list", "jobs", "items"):
-            if isinstance(data.get(key), list):
-                return data[key]
+            val = data.get(key)
+            if isinstance(val, list):
+                return val
+            # 公司職缺 API:data.list = {"topJobs": [...], "normalJobs": [...]}
+            if isinstance(val, dict):
+                merged = []
+                for sub in ("topJobs", "normalJobs"):
+                    if isinstance(val.get(sub), list):
+                        merged.extend(val[sub])
+                if merged:
+                    return merged
     return []
 
 
@@ -109,7 +118,7 @@ def _parse_item(item: dict, keyword_group: str, default_company: str = "") -> di
     if job_url.startswith("//"):
         job_url = "https:" + job_url
 
-    desc = str(_pick(item, "description", "descSnippet", default=""))
+    desc = str(_pick(item, "description", "descSnippet", "jobDescription", default=""))
     return {
         "source": "104",
         "source_job_no": str(_pick(item, "jobNo", "id", "jobId")),
@@ -118,12 +127,12 @@ def _parse_item(item: dict, keyword_group: str, default_company: str = "") -> di
         "company_no": str(_pick(item, "custNo", "companyNo")),
         "company_hash": _company_hash(item),
         "location": _pick(item, "jobAddrNoDesc", "jobAddress", "area"),
-        "salary": _format_salary(item),
+        "salary": _format_salary(item) if ("salaryLow" in item or "salaryHigh" in item) else str(_pick(item, "jobSalaryDesc", "salaryDesc")),
         "posted_date": str(_pick(item, "appearDate", "postedDate")),
         "url": job_url,
         "keyword_group": keyword_group,
         "description": desc[:DESC_MAX_CHARS],
-        "period": _format_period(item),
+        "period": _format_period(item) if "period" in item else str(_pick(item, "periodDesc")),
         "apply_cnt": int(item.get("applyCnt") or 0),
         "co_industry": _pick(item, "coIndustryDesc"),
         "employee_count": int(item.get("employeeCount") or 0),
@@ -273,12 +282,18 @@ def fetch_watchlist(cfg: dict, resolved: list[dict]) -> list[dict]:
             path = _company_jobs_path(code)
             try:
                 company_active = matched = 0
+                seen_nos = set()
+                total_pages = WATCHLIST_MAX_PAGES
                 page = 1
-                while page <= WATCHLIST_MAX_PAGES:
+                while page <= min(total_pages, WATCHLIST_MAX_PAGES):
                     params = {"page": page, "pageSize": COMPANY_JOBS_PAGESIZE}
                     resp = _get_with_retry(client, path, params, referer=f"{BASE}/company/{code}")
                     payload = resp.json()
                     _dump_debug(payload, "sample_company_jobs.json")
+
+                    data = payload.get("data", {})
+                    if isinstance(data, dict) and data.get("totalPages"):
+                        total_pages = int(data["totalPages"])
 
                     items = _extract_items(payload)
                     if not items:
@@ -286,8 +301,9 @@ def fetch_watchlist(cfg: dict, resolved: list[dict]) -> list[dict]:
 
                     for item in items:
                         parsed = _parse_item(item, "watchlist", default_company=name)
-                        if not parsed["source_job_no"]:
+                        if not parsed["source_job_no"] or parsed["source_job_no"] in seen_nos:
                             continue
+                        seen_nos.add(parsed["source_job_no"])
                         company_active += 1
                         text = (parsed["title"] + " " + parsed["description"]).lower()
                         hit_group = next((g for kw, g in flat_keywords if kw in text), None)
@@ -297,9 +313,6 @@ def fetch_watchlist(cfg: dict, resolved: list[dict]) -> list[dict]:
                             results.append(parsed)
                             matched += 1
 
-                    # 不足一頁 = 已到最後一頁
-                    if len(items) < COMPANY_JOBS_PAGESIZE:
-                        break
                     page += 1
                     time.sleep(delay)
 
