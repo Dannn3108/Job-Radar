@@ -40,14 +40,21 @@ def main() -> None:
             "detail": "ℹ watchlist 尚無公司代碼(未曾出現在搜尋結果,系統將自動累積): " + "、".join(unresolved),
         })
 
-    # 4. 過濾(職稱排除 + 公司排除;blacklist 只影響 Sheet 顯示,不影響入庫統計)
+    # 4. 過濾(職稱排除 + 公司 hash 嚴格排除;blacklist 只影響 Sheet 顯示)
     ex_title = cfg.get("exclude_title_keywords", []) or []
-    ex_co = cfg.get("exclude_companies", []) or []
+    excluded_resolved = db.resolve_watchlist(conn, cfg.get("excluded_companies", []))
+    excluded_hashes = {e["company_no"] for e in excluded_resolved if e["company_no"]}
+    unresolved_ex = [e["name"] for e in excluded_resolved if not e["company_no"]]
+    if unresolved_ex:
+        system_signals.append({
+            "type": "system", "company": "-",
+            "detail": "ℹ Blacklist 分頁的排除公司尚無 hash(系統將自動解析,或手動補 I 欄): " + "、".join(unresolved_ex),
+        })
 
     def keep(j: dict) -> bool:
         if any(x in j["title"] for x in ex_title):
             return False
-        if any(x in j["company"] for x in ex_co):
+        if j.get("company_hash") and j["company_hash"] in excluded_hashes:
             return False
         return True
 
@@ -111,9 +118,17 @@ def main() -> None:
     path = digest.write_markdown_digest(conn, all_signals, stats)
     print(f"Digest 已寫入 {path}")
 
-    # watchlist 代碼回寫:把本次執行後可解析的最新代碼帶回 Sheet
+    # 代碼回寫:watchlist 與 excluded companies 的最新解析結果帶回 Sheet
     watchlist_final = db.resolve_watchlist(conn, cfg.get("watchlist", []))
-    digest.push_to_sheet(conn, all_signals, cfg, watchlist_final, db.all_active_job_ids(conn))
+    excluded_final = db.resolve_watchlist(conn, cfg.get("excluded_companies", []))
+    watch_hashes = {w["company_no"] for w in watchlist_final if w["company_no"]}
+    digest.push_to_sheet(
+        conn, all_signals, cfg,
+        watchlist_final, excluded_final,
+        {e["company_no"] for e in excluded_final if e["company_no"]},
+        watch_hashes,
+        db.all_active_job_ids(conn),
+    )
 
     conn.close()
 
