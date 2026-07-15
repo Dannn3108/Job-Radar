@@ -16,21 +16,21 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 # Sheet 端可覆蓋的鍵
 SHEET_KEYS = (
     "keyword_groups", "areas", "jobexp",
-    "exclude_title_keywords", "exclude_companies",
+    "exclude_title_keywords", "excluded_companies",
     "watchlist", "blacklist",
 )
 
 
-def _normalize_watchlist(cfg: dict) -> None:
-    """yaml 的 watchlist 是純名字列表,統一轉成 dict 格式。"""
+def _normalize_company_list(cfg: dict, key: str) -> None:
+    """公司清單統一轉成 [{"name":..., "company_no":...}] 格式(容忍純名字列表)。"""
     normalized = []
-    for w in cfg.get("watchlist", []) or []:
+    for w in cfg.get(key, []) or []:
         if isinstance(w, dict):
             normalized.append({"name": str(w.get("name", "")).strip(),
                                "company_no": str(w.get("company_no", "")).strip()})
         else:
             normalized.append({"name": str(w).strip(), "company_no": ""})
-    cfg["watchlist"] = [w for w in normalized if w["name"]]
+    cfg[key] = [w for w in normalized if w["name"]]
 
 
 def load() -> dict:
@@ -61,6 +61,11 @@ def load() -> dict:
         except Exception as e:
             cfg["_config_source"] = f"yaml_fallback ({type(e).__name__}: {e})"
 
-    _normalize_watchlist(cfg)
+    # yaml fallback 的舊鍵名相容:exclude_companies(純名單)→ excluded_companies
+    if "excluded_companies" not in cfg and cfg.get("exclude_companies"):
+        cfg["excluded_companies"] = cfg.get("exclude_companies")
+    cfg.setdefault("excluded_companies", [])
+    _normalize_company_list(cfg, "watchlist")
+    _normalize_company_list(cfg, "excluded_companies")
     cfg["blacklist"] = [str(b).strip() for b in (cfg.get("blacklist") or []) if str(b).strip()]
     return cfg
